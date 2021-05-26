@@ -28,14 +28,15 @@ extern std::vector<std::string> defaultSearchPaths;
 #include "stb_image.h"
 
 #include "hello_vulkan.h"
+#include "nvh/alignment.hpp"
 #include "nvh/cameramanipulator.hpp"
+#include "nvh/fileoperations.hpp"
+#include "nvvk/commands_vk.hpp"
 #include "nvvk/descriptorsets_vk.hpp"
 #include "nvvk/images_vk.hpp"
 #include "nvvk/pipeline_vk.hpp"
-
-#include "nvh/fileoperations.hpp"
-#include "nvvk/commands_vk.hpp"
 #include "nvvk/renderpasses_vk.hpp"
+#include "nvvk/shaders_vk.hpp"
 
 
 // Holding the camera matrices
@@ -44,7 +45,10 @@ struct CameraMatrices
   nvmath::mat4f view;
   nvmath::mat4f proj;
   nvmath::mat4f viewInverse;
+  // #VKRay
+  nvmath::mat4f projInverse;
 };
+
 
 //--------------------------------------------------------------------------------------------------
 // Keep the handle on the device
@@ -73,10 +77,13 @@ void HelloVulkan::updateUniformBuffer(const vk::CommandBuffer& cmdBuf)
   hostUBO.proj = nvmath::perspectiveVK(CameraManip.getFov(), aspectRatio, 0.1f, 1000.0f);
   // hostUBO.proj[1][1] *= -1;  // Inverting Y for Vulkan (not needed with perspectiveVK).
   hostUBO.viewInverse = nvmath::invert(hostUBO.view);
+  // #VKRay
+  hostUBO.projInverse = nvmath::invert(hostUBO.proj);
 
   // UBO on the device, and what stages access it.
-  vk::Buffer deviceUBO      = m_cameraMat.buffer;
-  auto       uboUsageStages = vk::PipelineStageFlagBits::eVertexShader;
+  vk::Buffer deviceUBO = m_cameraMat.buffer;
+  auto       uboUsageStages =
+      vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eRayTracingShaderKHR;
 
   // Ensure that the modified UBO is not visible to previous frames.
   vk::BufferMemoryBarrier beforeBarrier;
@@ -115,18 +122,26 @@ void HelloVulkan::createDescriptorSetLayout()
   uint32_t nbObj = static_cast<uint32_t>(m_objModel.size());
 
   // Camera matrices (binding = 0)
-  m_descSetLayoutBind.addBinding(vkDS(0, vkDT::eUniformBuffer, 1, vkSS::eVertex));
+  m_descSetLayoutBind.addBinding(
+      vkDS(0, vkDT::eUniformBuffer, 1, vkSS::eVertex | vkSS::eRaygenKHR));
   // Materials (binding = 1)
   m_descSetLayoutBind.addBinding(
-      vkDS(1, vkDT::eStorageBuffer, nbObj, vkSS::eVertex | vkSS::eFragment));
+      vkDS(1, vkDT::eStorageBuffer, nbObj, vkSS::eVertex | vkSS::eFragment | vkSS::eClosestHitKHR));
   // Scene description (binding = 2)
   m_descSetLayoutBind.addBinding(  //
-      vkDS(2, vkDT::eStorageBuffer, 1, vkSS::eVertex | vkSS::eFragment));
+      vkDS(2, vkDT::eStorageBuffer, 1, vkSS::eVertex | vkSS::eFragment | vkSS::eClosestHitKHR));
   // Textures (binding = 3)
-  m_descSetLayoutBind.addBinding(vkDS(3, vkDT::eCombinedImageSampler, nbTxt, vkSS::eFragment));
-
+  m_descSetLayoutBind.addBinding(
+      vkDS(3, vkDT::eCombinedImageSampler, nbTxt, vkSS::eFragment | vkSS::eClosestHitKHR));
   // Materials (binding = 4)
-  m_descSetLayoutBind.addBinding(vkDS(4, vkDT::eStorageBuffer, nbObj, vkSS::eFragment));
+  m_descSetLayoutBind.addBinding(
+      vkDS(4, vkDT::eStorageBuffer, nbObj, vkSS::eFragment | vkSS::eClosestHitKHR));
+  // Storing vertices (binding = 5)
+  m_descSetLayoutBind.addBinding(  //
+      vkDS(5, vkDT::eStorageBuffer, nbObj, vkSS::eClosestHitKHR));
+  // Storing indices (binding = 6)
+  m_descSetLayoutBind.addBinding(  //
+      vkDS(6, vkDT::eStorageBuffer, nbObj, vkSS::eClosestHitKHR));
 
 
   m_descSetLayout = m_descSetLayoutBind.createLayout(m_device);
@@ -150,26 +165,31 @@ void HelloVulkan::updateDescriptorSet()
   // All material buffers, 1 buffer per OBJ
   std::vector<vk::DescriptorBufferInfo> dbiMat;
   std::vector<vk::DescriptorBufferInfo> dbiMatIdx;
-  for(size_t i = 0; i < m_objModel.size(); ++i)
+  std::vector<vk::DescriptorBufferInfo> dbiVert;
+  std::vector<vk::DescriptorBufferInfo> dbiIdx;
+  for(auto& obj : m_objModel)
   {
-    dbiMat.push_back({m_objModel[i].matColorBuffer.buffer, 0, VK_WHOLE_SIZE});
-    dbiMatIdx.push_back({m_objModel[i].matIndexBuffer.buffer, 0, VK_WHOLE_SIZE});
+    dbiMat.emplace_back(obj.matColorBuffer.buffer, 0, VK_WHOLE_SIZE);
+    dbiMatIdx.emplace_back(obj.matIndexBuffer.buffer, 0, VK_WHOLE_SIZE);
+    dbiVert.emplace_back(obj.vertexBuffer.buffer, 0, VK_WHOLE_SIZE);
+    dbiIdx.emplace_back(obj.indexBuffer.buffer, 0, VK_WHOLE_SIZE);
   }
   writes.emplace_back(m_descSetLayoutBind.makeWriteArray(m_descSet, 1, dbiMat.data()));
   writes.emplace_back(m_descSetLayoutBind.makeWriteArray(m_descSet, 4, dbiMatIdx.data()));
+  writes.emplace_back(m_descSetLayoutBind.makeWriteArray(m_descSet, 5, dbiVert.data()));
+  writes.emplace_back(m_descSetLayoutBind.makeWriteArray(m_descSet, 6, dbiIdx.data()));
 
   // All texture samplers
   std::vector<vk::DescriptorImageInfo> diit;
-  for(size_t i = 0; i < m_textures.size(); ++i)
+  for(auto& texture : m_textures)
   {
-    diit.push_back(m_textures[i].descriptor);
+    diit.emplace_back(texture.descriptor);
   }
   writes.emplace_back(m_descSetLayoutBind.makeWriteArray(m_descSet, 3, diit.data()));
 
   // Writing the information
   m_device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
-
 
 //--------------------------------------------------------------------------------------------------
 // Creating the pipeline layout
@@ -239,10 +259,16 @@ void HelloVulkan::loadModel(const std::string& filename, nvmath::mat4f transform
   // Create the buffers on Device and copy vertices, indices and materials
   nvvk::CommandPool cmdBufGet(m_device, m_graphicsQueueIndex);
   vk::CommandBuffer cmdBuf = cmdBufGet.createCommandBuffer();
-  model.vertexBuffer       = m_alloc.createBuffer(cmdBuf, loader.m_vertices, vkBU::eVertexBuffer);
-  model.indexBuffer        = m_alloc.createBuffer(cmdBuf, loader.m_indices, vkBU::eIndexBuffer);
-  model.matColorBuffer     = m_alloc.createBuffer(cmdBuf, loader.m_materials, vkBU::eStorageBuffer);
-  model.matIndexBuffer     = m_alloc.createBuffer(cmdBuf, loader.m_matIndx, vkBU::eStorageBuffer);
+  model.vertexBuffer =
+      m_alloc.createBuffer(cmdBuf, loader.m_vertices,
+                           vkBU::eVertexBuffer | vkBU::eStorageBuffer | vkBU::eShaderDeviceAddress
+                               | vkBU::eAccelerationStructureBuildInputReadOnlyKHR);
+  model.indexBuffer =
+      m_alloc.createBuffer(cmdBuf, loader.m_indices,
+                           vkBU::eIndexBuffer | vkBU::eStorageBuffer | vkBU::eShaderDeviceAddress
+                               | vkBU::eAccelerationStructureBuildInputReadOnlyKHR);
+  model.matColorBuffer = m_alloc.createBuffer(cmdBuf, loader.m_materials, vkBU::eStorageBuffer);
+  model.matIndexBuffer = m_alloc.createBuffer(cmdBuf, loader.m_matIndx, vkBU::eStorageBuffer);
   // Creates all textures found
   createTextureImages(cmdBuf, loader.m_textures);
   cmdBufGet.submitAndWait(cmdBuf);
@@ -257,7 +283,6 @@ void HelloVulkan::loadModel(const std::string& filename, nvmath::mat4f transform
   m_objModel.emplace_back(model);
   m_objInstance.emplace_back(instance);
 }
-
 
 //--------------------------------------------------------------------------------------------------
 // Creating the uniform buffer holding the camera matrices
@@ -402,6 +427,11 @@ void HelloVulkan::destroyResources()
   m_device.destroy(m_offscreenRenderPass);
   m_device.destroy(m_offscreenFramebuffer);
 
+  // #VKRay
+  m_rtBuilder.destroy();
+  m_device.destroy(m_rtDescPool);
+  m_device.destroy(m_rtDescSetLayout);
+
   m_alloc.deinit();
 }
 
@@ -419,7 +449,6 @@ void HelloVulkan::rasterize(const vk::CommandBuffer& cmdBuf)
   // Dynamic Viewport
   cmdBuf.setViewport(0, {vk::Viewport(0, 0, (float)m_size.width, (float)m_size.height, 0, 1)});
   cmdBuf.setScissor(0, {{{0, 0}, {m_size.width, m_size.height}}});
-
 
   // Drawing all triangles
   cmdBuf.bindPipeline(vkPBP::eGraphics, m_graphicsPipeline);
@@ -446,13 +475,12 @@ void HelloVulkan::onResize(int /*w*/, int /*h*/)
 {
   createOffscreenRender();
   updatePostDescriptorSet();
+  updateRtDescriptorSet();
 }
-
 
 //////////////////////////////////////////////////////////////////////////
 // Post-processing
 //////////////////////////////////////////////////////////////////////////
-
 
 //--------------------------------------------------------------------------------------------------
 // Creating an offscreen frame buffer and the associated render pass
@@ -512,7 +540,6 @@ void HelloVulkan::createOffscreenRender()
         nvvk::createRenderPass(m_device, {m_offscreenColorFormat}, m_offscreenDepthFormat, 1, true,
                                true, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral);
   }
-
 
   // Creating the frame buffer for offscreen
   std::vector<vk::ImageView> attachments = {m_offscreenColor.descriptor.imageView,
@@ -574,7 +601,6 @@ void HelloVulkan::createPostDescriptor()
   m_postDescSet       = nvvk::allocateDescriptorSet(m_device, m_postDescPool, m_postDescSetLayout);
 }
 
-
 //--------------------------------------------------------------------------------------------------
 // Update the output
 //
@@ -604,4 +630,145 @@ void HelloVulkan::drawPost(vk::CommandBuffer cmdBuf)
   cmdBuf.draw(3, 1, 0, 0);
 
   m_debug.endLabel(cmdBuf);
+}
+
+//////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////
+
+//--------------------------------------------------------------------------------------------------
+// Initialize Vulkan ray tracing
+// #VKRay
+void HelloVulkan::initRayTracing()
+{
+  // Requesting ray tracing properties
+  auto properties =
+      m_physicalDevice.getProperties2<vk::PhysicalDeviceProperties2,
+                                      vk::PhysicalDeviceRayTracingPipelinePropertiesKHR>();
+  m_rtProperties = properties.get<vk::PhysicalDeviceRayTracingPipelinePropertiesKHR>();
+  m_rtBuilder.setup(m_device, &m_alloc, m_graphicsQueueIndex);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Convert an OBJ model into the ray tracing geometry used to build the BLAS
+//
+nvvk::RaytracingBuilderKHR::BlasInput HelloVulkan::objectToVkGeometryKHR(const ObjModel& model)
+{
+  // BLAS builder requires raw device addresses.
+  vk::DeviceAddress vertexAddress = m_device.getBufferAddress({model.vertexBuffer.buffer});
+  vk::DeviceAddress indexAddress  = m_device.getBufferAddress({model.indexBuffer.buffer});
+
+  uint32_t maxPrimitiveCount = model.nbIndices / 3;
+
+  // Describe buffer as array of VertexObj.
+  vk::AccelerationStructureGeometryTrianglesDataKHR triangles;
+  triangles.setVertexFormat(vk::Format::eR32G32B32Sfloat);  // vec3 vertex position data.
+  triangles.setVertexData(vertexAddress);
+  triangles.setVertexStride(sizeof(VertexObj));
+  // Describe index data (32-bit unsigned int)
+  triangles.setIndexType(vk::IndexType::eUint32);
+  triangles.setIndexData(indexAddress);
+  // Indicate identity transform by setting transformData to null device pointer.
+  triangles.setTransformData({});
+  triangles.setMaxVertex(model.nbVertices);
+
+  // Identify the above data as containing opaque triangles.
+  vk::AccelerationStructureGeometryKHR asGeom;
+  asGeom.setGeometryType(vk::GeometryTypeKHR::eTriangles);
+  asGeom.setFlags(vk::GeometryFlagBitsKHR::eOpaque);
+  asGeom.geometry.setTriangles(triangles);
+
+  // The entire array will be used to build the BLAS.
+  vk::AccelerationStructureBuildRangeInfoKHR offset;
+  offset.setFirstVertex(0);
+  offset.setPrimitiveCount(maxPrimitiveCount);
+  offset.setPrimitiveOffset(0);
+  offset.setTransformOffset(0);
+
+  // Our blas is made from only one geometry, but could be made of many geometries
+  nvvk::RaytracingBuilderKHR::BlasInput input;
+  input.asGeometry.emplace_back(asGeom);
+  input.asBuildOffsetInfo.emplace_back(offset);
+
+  return input;
+}
+
+//--------------------------------------------------------------------------------------------------
+//
+//
+void HelloVulkan::createBottomLevelAS()
+{
+  // BLAS - Storing each primitive in a geometry
+  std::vector<nvvk::RaytracingBuilderKHR::BlasInput> allBlas;
+  allBlas.reserve(m_objModel.size());
+  for(const auto& obj : m_objModel)
+  {
+    auto blas = objectToVkGeometryKHR(obj);
+
+    // We could add more geometry in each BLAS, but we add only one for now
+    allBlas.emplace_back(blas);
+  }
+  m_rtBuilder.buildBlas(allBlas, vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace);
+}
+
+void HelloVulkan::createTopLevelAS()
+{
+  std::vector<nvvk::RaytracingBuilderKHR::Instance> tlas;
+  tlas.reserve(m_objInstance.size());
+  for(uint32_t i = 0; i < static_cast<uint32_t>(m_objInstance.size()); i++)
+  {
+    nvvk::RaytracingBuilderKHR::Instance rayInst;
+    rayInst.transform        = m_objInstance[i].transform;  // Position of the instance
+    rayInst.instanceCustomId = i;                           // gl_InstanceCustomIndexEXT
+    rayInst.blasId           = m_objInstance[i].objIndex;
+    rayInst.hitGroupId       = 0;  // We will use the same hit group for all objects
+    rayInst.flags            = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    tlas.emplace_back(rayInst);
+  }
+  m_rtBuilder.buildTlas(tlas, vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace);
+}
+
+//--------------------------------------------------------------------------------------------------
+// This descriptor set holds the Acceleration structure and the output image
+//
+void HelloVulkan::createRtDescriptorSet()
+{
+  using vkDT   = vk::DescriptorType;
+  using vkSS   = vk::ShaderStageFlagBits;
+  using vkDSLB = vk::DescriptorSetLayoutBinding;
+
+  m_rtDescSetLayoutBind.addBinding(vkDSLB(0, vkDT::eAccelerationStructureKHR, 1,
+                                          vkSS::eRaygenKHR | vkSS::eClosestHitKHR));  // TLAS
+  m_rtDescSetLayoutBind.addBinding(vkDSLB(1, vkDT::eStorageImage, 1, vkSS::eRaygenKHR));  // Output image
+
+  m_rtDescPool      = m_rtDescSetLayoutBind.createPool(m_device);
+  m_rtDescSetLayout = m_rtDescSetLayoutBind.createLayout(m_device);
+  m_rtDescSet       = m_device.allocateDescriptorSets({m_rtDescPool, 1, &m_rtDescSetLayout})[0];
+
+  vk::AccelerationStructureKHR                   tlas = m_rtBuilder.getAccelerationStructure();
+  vk::WriteDescriptorSetAccelerationStructureKHR descASInfo;
+  descASInfo.setAccelerationStructureCount(1);
+  descASInfo.setPAccelerationStructures(&tlas);
+  vk::DescriptorImageInfo imageInfo{
+      {}, m_offscreenColor.descriptor.imageView, vk::ImageLayout::eGeneral};
+
+  std::vector<vk::WriteDescriptorSet> writes;
+  writes.emplace_back(m_rtDescSetLayoutBind.makeWrite(m_rtDescSet, 0, &descASInfo));
+  writes.emplace_back(m_rtDescSetLayoutBind.makeWrite(m_rtDescSet, 1, &imageInfo));
+  m_device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Writes the output image to the descriptor set
+// - Required when changing resolution
+//
+void HelloVulkan::updateRtDescriptorSet()
+{
+  using vkDT = vk::DescriptorType;
+
+  // (1) Output buffer
+  vk::DescriptorImageInfo imageInfo{
+      {}, m_offscreenColor.descriptor.imageView, vk::ImageLayout::eGeneral};
+  vk::WriteDescriptorSet wds{m_rtDescSet, 1, 0, 1, vkDT::eStorageImage, &imageInfo};
+  m_device.updateDescriptorSets(wds, nullptr);
 }

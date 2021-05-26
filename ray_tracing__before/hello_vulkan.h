@@ -24,6 +24,7 @@
 #include "nvvk/debug_util_vk.hpp"
 #include "nvvk/descriptorsets_vk.hpp"
 #include "nvvk/resourceallocator_vk.hpp"
+#include "nvvk/raytraceKHR_vk.hpp"
 
 //--------------------------------------------------------------------------------------------------
 // Simple rasterizer of OBJ objects
@@ -123,4 +124,19 @@ public:
   vk::Format                  m_offscreenColorFormat{vk::Format::eR32G32B32A32Sfloat};
   nvvk::Texture               m_offscreenDepth;
   vk::Format                  m_offscreenDepthFormat;
+
+  // #VKRay
+  void initRayTracing();
+  nvvk::RaytracingBuilderKHR::BlasInput objectToVkGeometryKHR(const ObjModel& model);
+  void createBottomLevelAS();
+  void createTopLevelAS();
+  void createRtDescriptorSet();
+  void updateRtDescriptorSet();
+
+  vk::PhysicalDeviceRayTracingPipelinePropertiesKHR m_rtProperties;
+  nvvk::RaytracingBuilderKHR                        m_rtBuilder;
+  nvvk::DescriptorSetBindings                       m_rtDescSetLayoutBind;
+  vk::DescriptorPool                                m_rtDescPool;
+  vk::DescriptorSetLayout                           m_rtDescSetLayout;
+  vk::DescriptorSet                                 m_rtDescSet;
 };
