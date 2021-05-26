@@ -186,11 +186,14 @@ int main(int argc, char** argv)
   helloVk.createBottomLevelAS();
   helloVk.createTopLevelAS();
   helloVk.createRtDescriptorSet();
+  helloVk.createRtPipeline();
+  helloVk.createRtShaderBindingTable();
 
   helloVk.createPostDescriptor();
   helloVk.createPostPipeline();
   helloVk.updatePostDescriptorSet();
   nvmath::vec4f clearColor = nvmath::vec4f(1, 1, 1, 1.00f);
+  bool          useRaytracer = true;
 
 
   helloVk.setupGlfwCallbacks(window);
@@ -212,6 +215,9 @@ int main(int argc, char** argv)
     {
       ImGuiH::Panel::Begin();
       ImGui::ColorEdit3("Clear color", reinterpret_cast<float*>(&clearColor));
+      ImGui::Checkbox("Enable Ray Tracer", &useRaytracer);  // Switch between raster and ray tracing
+
+
       renderUI(helloVk);
       ImGui::Text("Application average %.3f ms/frame (%.1f FPS)",
                   1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
@@ -248,9 +254,16 @@ int main(int argc, char** argv)
       offscreenRenderPassBeginInfo.setRenderArea({{}, helloVk.getSize()});
 
       // Rendering Scene
-      cmdBuf.beginRenderPass(offscreenRenderPassBeginInfo, vk::SubpassContents::eInline);
-      helloVk.rasterize(cmdBuf);
-      cmdBuf.endRenderPass();
+      if(useRaytracer)
+      {
+        helloVk.raytrace(cmdBuf, clearColor);
+      }
+      else
+      {
+        cmdBuf.beginRenderPass(offscreenRenderPassBeginInfo, vk::SubpassContents::eInline);
+        helloVk.rasterize(cmdBuf);
+        cmdBuf.endRenderPass();
+      }
     }
 
 

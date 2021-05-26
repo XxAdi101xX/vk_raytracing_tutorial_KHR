@@ -431,6 +431,9 @@ void HelloVulkan::destroyResources()
   m_rtBuilder.destroy();
   m_device.destroy(m_rtDescPool);
   m_device.destroy(m_rtDescSetLayout);
+  m_device.destroy(m_rtPipeline);
+  m_device.destroy(m_rtPipelineLayout);
+  m_alloc.destroy(m_rtSBTBuffer);
 
   m_alloc.deinit();
 }
@@ -771,4 +774,173 @@ void HelloVulkan::updateRtDescriptorSet()
       {}, m_offscreenColor.descriptor.imageView, vk::ImageLayout::eGeneral};
   vk::WriteDescriptorSet wds{m_rtDescSet, 1, 0, 1, vkDT::eStorageImage, &imageInfo};
   m_device.updateDescriptorSets(wds, nullptr);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Pipeline for the ray tracer: all shaders, raygen, chit, miss
+//
+void HelloVulkan::createRtPipeline()
+{
+  std::vector<std::string> paths = defaultSearchPaths;
+
+  vk::ShaderModule raygenSM =
+      nvvk::createShaderModule(m_device,  //
+                               nvh::loadFile("spv/raytrace.rgen.spv", true, paths, true));
+  vk::ShaderModule missSM =
+      nvvk::createShaderModule(m_device,  //
+                               nvh::loadFile("spv/raytrace.rmiss.spv", true, paths, true));
+  vk::ShaderModule chitSM =
+      nvvk::createShaderModule(m_device,  //
+                               nvh::loadFile("spv/raytrace.rchit.spv", true, paths, true));
+
+  std::vector<vk::PipelineShaderStageCreateInfo> stages;
+
+  // Raygen
+  vk::RayTracingShaderGroupCreateInfoKHR rg{vk::RayTracingShaderGroupTypeKHR::eGeneral,
+                                            VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR,
+                                            VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR};
+  rg.setGeneralShader(static_cast<uint32_t>(stages.size()));
+  stages.push_back({{}, vk::ShaderStageFlagBits::eRaygenKHR, raygenSM, "main"});
+  m_rtShaderGroups.push_back(rg);
+  // Miss
+  vk::RayTracingShaderGroupCreateInfoKHR mg{vk::RayTracingShaderGroupTypeKHR::eGeneral,
+                                            VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR,
+                                            VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR};
+  mg.setGeneralShader(static_cast<uint32_t>(stages.size()));
+  stages.push_back({{}, vk::ShaderStageFlagBits::eMissKHR, missSM, "main"});
+  m_rtShaderGroups.push_back(mg);
+  // Hit Group - Closest Hit + AnyHit
+  vk::RayTracingShaderGroupCreateInfoKHR hg{vk::RayTracingShaderGroupTypeKHR::eTrianglesHitGroup,
+                                            VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR,
+                                            VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR};
+  hg.setClosestHitShader(static_cast<uint32_t>(stages.size()));
+  stages.push_back({{}, vk::ShaderStageFlagBits::eClosestHitKHR, chitSM, "main"});
+  m_rtShaderGroups.push_back(hg);
+
+  vk::PipelineLayoutCreateInfo pipelineLayoutCreateInfo;
+
+  // Push constant: we want to be able to update constants used by the shaders
+  vk::PushConstantRange pushConstant{vk::ShaderStageFlagBits::eRaygenKHR
+                                         | vk::ShaderStageFlagBits::eClosestHitKHR
+                                         | vk::ShaderStageFlagBits::eMissKHR,
+                                     0, sizeof(RtPushConstant)};
+  pipelineLayoutCreateInfo.setPushConstantRangeCount(1);
+  pipelineLayoutCreateInfo.setPPushConstantRanges(&pushConstant);
+
+  // Descriptor sets: one specific to ray tracing, and one shared with the rasterization pipeline
+  std::vector<vk::DescriptorSetLayout> rtDescSetLayouts = {m_rtDescSetLayout, m_descSetLayout};
+  pipelineLayoutCreateInfo.setSetLayoutCount(static_cast<uint32_t>(rtDescSetLayouts.size()));
+  pipelineLayoutCreateInfo.setPSetLayouts(rtDescSetLayouts.data());
+
+  m_rtPipelineLayout = m_device.createPipelineLayout(pipelineLayoutCreateInfo);
+
+  // Assemble the shader stages and recursion depth info into the ray tracing pipeline
+  vk::RayTracingPipelineCreateInfoKHR rayPipelineInfo;
+  rayPipelineInfo.setStageCount(static_cast<uint32_t>(stages.size()));  // Stages are shaders
+  rayPipelineInfo.setPStages(stages.data());
+
+  // In this case, m_rtShaderGroups.size() == 4: we have one raygen group,
+  // two miss shader groups, and one hit group.
+  rayPipelineInfo.setGroupCount(static_cast<uint32_t>(m_rtShaderGroups.size()));
+  rayPipelineInfo.setPGroups(m_rtShaderGroups.data());
+
+  rayPipelineInfo.setMaxPipelineRayRecursionDepth(1);  // Ray depth
+  rayPipelineInfo.setLayout(m_rtPipelineLayout);
+  m_rtPipeline = static_cast<const vk::Pipeline&>(m_device.createRayTracingPipelineKHR({}, {}, rayPipelineInfo));
+
+  // Spec only guarantees 1 level of "recursion". Check for that sad possibility here.
+  if(m_rtProperties.maxRayRecursionDepth <= 1)
+  {
+    throw std::runtime_error(
+        "Device fails to support ray recursion (m_rtProperties.maxRayRecursionDepth <= 1)");
+  }
+
+  m_device.destroy(raygenSM);
+  m_device.destroy(missSM);
+  m_device.destroy(chitSM);
+}
+
+// The Shader Binding Table (SBT)
+// - getting all shader handles and write them in a SBT buffer
+// - Besides exception, this could be always done like this
+//   See how the SBT buffer is used in run()
+//
+void HelloVulkan::createRtShaderBindingTable()
+{
+  auto groupCount =
+      static_cast<uint32_t>(m_rtShaderGroups.size());               // 3 shaders: raygen, miss, chit
+  uint32_t groupHandleSize = m_rtProperties.shaderGroupHandleSize;  // Size of a program identifier
+  // Compute the actual size needed per SBT entry (round-up to alignment needed).
+  uint32_t groupSizeAligned =
+      nvh::align_up(groupHandleSize, m_rtProperties.shaderGroupBaseAlignment);
+  // Bytes needed for the SBT.
+  uint32_t sbtSize = groupCount * groupSizeAligned;
+
+  // Fetch all the shader handles used in the pipeline. This is opaque data,
+  // so we store it in a vector of bytes.
+  std::vector<uint8_t> shaderHandleStorage(sbtSize);
+  auto result = m_device.getRayTracingShaderGroupHandlesKHR(m_rtPipeline, 0, groupCount, sbtSize,
+                                                            shaderHandleStorage.data());
+  assert(result == vk::Result::eSuccess);
+
+  // Allocate a buffer for storing the SBT. Give it a debug name for NSight.
+  m_rtSBTBuffer = m_alloc.createBuffer(
+      sbtSize,
+      vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eShaderDeviceAddress
+          | vk::BufferUsageFlagBits::eShaderBindingTableKHR,
+      vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+  m_debug.setObjectName(m_rtSBTBuffer.buffer, std::string("SBT").c_str());
+
+  // Map the SBT buffer and write in the handles.
+  void* mapped = m_alloc.map(m_rtSBTBuffer);
+  auto* pData  = reinterpret_cast<uint8_t*>(mapped);
+  for(uint32_t g = 0; g < groupCount; g++)
+  {
+    memcpy(pData, shaderHandleStorage.data() + g * groupHandleSize, groupHandleSize);
+    pData += groupSizeAligned;
+  }
+  m_alloc.unmap(m_rtSBTBuffer);
+  m_alloc.finalizeAndReleaseStaging();
+}
+
+//--------------------------------------------------------------------------------------------------
+// Ray Tracing the scene
+//
+void HelloVulkan::raytrace(const vk::CommandBuffer& cmdBuf, const nvmath::vec4f& clearColor)
+{
+  m_debug.beginLabel(cmdBuf, "Ray trace");
+
+  // Initialize push constants
+  m_rtPushConstants.clearColor = clearColor;
+  m_rtPushConstants.lightPosition = m_pushConstant.lightPosition;
+  m_rtPushConstants.lightIntesity = m_pushConstant.lightIntensity;
+  m_rtPushConstants.lightType = m_pushConstant.lightType;
+
+  cmdBuf.bindPipeline(vk::PipelineBindPoint::eRayTracingKHR, m_rtPipeline);
+  cmdBuf.bindDescriptorSets(vk::PipelineBindPoint::eRayTracingKHR, m_rtPipelineLayout, 0,
+                            {m_rtDescSet, m_descSet}, {});
+  cmdBuf.pushConstants<RtPushConstant>(m_rtPipelineLayout,
+                                       vk::ShaderStageFlagBits::eRaygenKHR
+                                           | vk::ShaderStageFlagBits::eClosestHitKHR
+                                           | vk::ShaderStageFlagBits::eMissKHR,
+                                       0, m_rtPushConstants);
+
+  // Size of a program identifier
+  uint32_t groupSize =
+      nvh::align_up(m_rtProperties.shaderGroupHandleSize, m_rtProperties.shaderGroupBaseAlignment);
+  uint32_t          groupStride = groupSize;
+  vk::DeviceAddress sbtAddress  = m_device.getBufferAddress({m_rtSBTBuffer.buffer});
+
+  using Stride = vk::StridedDeviceAddressRegionKHR;
+  std::array<Stride, 4> strideAddresses{
+      Stride{sbtAddress + 0u * groupSize, groupStride, groupSize * 1},  // raygen
+      Stride{sbtAddress + 1u * groupSize, groupStride, groupSize * 1},  // miss
+      Stride{sbtAddress + 2u * groupSize, groupStride, groupSize * 1},  // hit
+      Stride{0u, 0u, 0u}};                                              // callable
+
+  cmdBuf.traceRaysKHR(&strideAddresses[0], &strideAddresses[1], &strideAddresses[2],
+                      &strideAddresses[3],              //
+                      m_size.width, m_size.height, 1);  //
+
+  m_debug.endLabel(cmdBuf);
 }

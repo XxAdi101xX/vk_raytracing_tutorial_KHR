@@ -132,11 +132,26 @@ public:
   void createTopLevelAS();
   void createRtDescriptorSet();
   void updateRtDescriptorSet();
+  void createRtPipeline();
+  void createRtShaderBindingTable();
+  void raytrace(const vk::CommandBuffer& cmdBuf, const nvmath::vec4f& clearColor);
 
-  vk::PhysicalDeviceRayTracingPipelinePropertiesKHR m_rtProperties;
-  nvvk::RaytracingBuilderKHR                        m_rtBuilder;
-  nvvk::DescriptorSetBindings                       m_rtDescSetLayoutBind;
-  vk::DescriptorPool                                m_rtDescPool;
-  vk::DescriptorSetLayout                           m_rtDescSetLayout;
-  vk::DescriptorSet                                 m_rtDescSet;
+  vk::PhysicalDeviceRayTracingPipelinePropertiesKHR   m_rtProperties;
+  nvvk::RaytracingBuilderKHR                          m_rtBuilder;
+  nvvk::DescriptorSetBindings                         m_rtDescSetLayoutBind;
+  vk::DescriptorPool                                  m_rtDescPool;
+  vk::DescriptorSetLayout                             m_rtDescSetLayout;
+  vk::DescriptorSet                                   m_rtDescSet;
+  std::vector<vk::RayTracingShaderGroupCreateInfoKHR> m_rtShaderGroups;
+  vk::PipelineLayout                                  m_rtPipelineLayout;
+  vk::Pipeline                                        m_rtPipeline;
+  nvvk::Buffer                                        m_rtSBTBuffer;
+
+  struct RtPushConstant
+  {
+    nvmath::vec4f clearColor;
+    nvmath::vec3f lightPosition;
+    float         lightIntesity;
+    int           lightType;
+  } m_rtPushConstants;
 };
