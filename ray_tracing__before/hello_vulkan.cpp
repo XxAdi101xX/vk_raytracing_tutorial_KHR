@@ -739,6 +739,8 @@ void HelloVulkan::createRtDescriptorSet()
   using vkSS   = vk::ShaderStageFlagBits;
   using vkDSLB = vk::DescriptorSetLayoutBinding;
 
+  // Top-level acceleration structure, usable by both the ray generation and the closest hit (to
+  // shoot shadow rays)
   m_rtDescSetLayoutBind.addBinding(vkDSLB(0, vkDT::eAccelerationStructureKHR, 1,
                                           vkSS::eRaygenKHR | vkSS::eClosestHitKHR));  // TLAS
   m_rtDescSetLayoutBind.addBinding(vkDSLB(1, vkDT::eStorageImage, 1, vkSS::eRaygenKHR));  // Output image
@@ -791,6 +793,10 @@ void HelloVulkan::createRtPipeline()
   vk::ShaderModule chitSM =
       nvvk::createShaderModule(m_device,  //
                                nvh::loadFile("spv/raytrace.rchit.spv", true, paths, true));
+  // The second miss shader is invoked when a shadow ray misses the geometry. It
+  // simply indicates that no occlusion has been found
+  vk::ShaderModule shadowmissSM = nvvk::createShaderModule(
+      m_device, nvh::loadFile("spv/raytraceShadow.rmiss.spv", true, paths, true));
 
   std::vector<vk::PipelineShaderStageCreateInfo> stages;
 
@@ -807,6 +813,10 @@ void HelloVulkan::createRtPipeline()
                                             VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR};
   mg.setGeneralShader(static_cast<uint32_t>(stages.size()));
   stages.push_back({{}, vk::ShaderStageFlagBits::eMissKHR, missSM, "main"});
+  m_rtShaderGroups.push_back(mg);
+  // Shadow Miss
+  mg.setGeneralShader(static_cast<uint32_t>(stages.size()));
+  stages.push_back({{}, vk::ShaderStageFlagBits::eMissKHR, shadowmissSM, "main"});
   m_rtShaderGroups.push_back(mg);
   // Hit Group - Closest Hit + AnyHit
   vk::RayTracingShaderGroupCreateInfoKHR hg{vk::RayTracingShaderGroupTypeKHR::eTrianglesHitGroup,
@@ -843,7 +853,7 @@ void HelloVulkan::createRtPipeline()
   rayPipelineInfo.setGroupCount(static_cast<uint32_t>(m_rtShaderGroups.size()));
   rayPipelineInfo.setPGroups(m_rtShaderGroups.data());
 
-  rayPipelineInfo.setMaxPipelineRayRecursionDepth(1);  // Ray depth
+  rayPipelineInfo.setMaxPipelineRayRecursionDepth(2);  // Ray depth
   rayPipelineInfo.setLayout(m_rtPipelineLayout);
   m_rtPipeline = static_cast<const vk::Pipeline&>(m_device.createRayTracingPipelineKHR({}, {}, rayPipelineInfo));
 
@@ -856,6 +866,7 @@ void HelloVulkan::createRtPipeline()
 
   m_device.destroy(raygenSM);
   m_device.destroy(missSM);
+  m_device.destroy(shadowmissSM);
   m_device.destroy(chitSM);
 }
 
@@ -933,8 +944,8 @@ void HelloVulkan::raytrace(const vk::CommandBuffer& cmdBuf, const nvmath::vec4f&
   using Stride = vk::StridedDeviceAddressRegionKHR;
   std::array<Stride, 4> strideAddresses{
       Stride{sbtAddress + 0u * groupSize, groupStride, groupSize * 1},  // raygen
-      Stride{sbtAddress + 1u * groupSize, groupStride, groupSize * 1},  // miss
-      Stride{sbtAddress + 2u * groupSize, groupStride, groupSize * 1},  // hit
+      Stride{sbtAddress + 1u * groupSize, groupStride, groupSize * 2},  // miss
+      Stride{sbtAddress + 3u * groupSize, groupStride, groupSize * 1},  // hit
       Stride{0u, 0u, 0u}};                                              // callable
 
   cmdBuf.traceRaysKHR(&strideAddresses[0], &strideAddresses[1], &strideAddresses[2],
